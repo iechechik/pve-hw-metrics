@@ -298,7 +298,7 @@ if [[ "$web_enable" == "yes" ]]; then
     echo "[INFO] Создаем hw-metrics-web.py..."
     cat << 'EOF_WEB' > /usr/local/bin/hw-metrics-web.py
 #!/usr/bin/env python3
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
 import concurrent.futures
 import html
@@ -336,7 +336,7 @@ def run_remote(host, hw_script, collect_script, service_script, timer_script, co
         check_cache = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", f"root@{host}",
              "test -f /var/cache/pve-metrics.json && grep -q 'COLLECTOR_VERSION=2' /usr/local/bin/collect-hw-metrics.sh"],
-            capture_output=True
+            capture_output=True, timeout=8
         )
 
         if check_cache.returncode != 0:
@@ -387,7 +387,12 @@ systemctl enable --now pve-metrics.timer
         return f"[ERROR SSH] {e}"
 
 class ScriptHandler(BaseHTTPRequestHandler):
+    timeout = 10  # пустое соединение (предзагрузка Chrome) закрывается через 10 с
+
     def do_GET(self):
+        if self.path.split('?')[0] != '/':
+            self.send_error(404)  # /favicon.ico и прочее не должны запускать опрос хостов
+            return
         hw_script = get_file_content("/usr/local/bin/hw-metrics.sh")
         collect_script = get_file_content("/usr/local/bin/collect-hw-metrics.sh")
         service_script = get_file_content("/etc/systemd/system/pve-metrics.service")
@@ -424,7 +429,9 @@ class ScriptHandler(BaseHTTPRequestHandler):
 
         page = f"""
         <html>
-        <head><title>Hardware Metrics</title></head>
+        <head><title>Hardware Metrics</title>
+        <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23121212'/><path d='M3 17h7l3-9 6 17 3-8h7' fill='none' stroke='%2300FF66' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+        </head>
         <body style="background: #121212; color: #00FF66; font-family: monospace; padding: 20px; font-size: 14px;">
         <pre>{html.escape(output)}</pre>
         </body>
@@ -433,7 +440,7 @@ class ScriptHandler(BaseHTTPRequestHandler):
         self.wfile.write(page.encode('utf-8'))
 
 if __name__ == '__main__':
-    server = HTTPServer(('0.0.0.0', PORT), ScriptHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', PORT), ScriptHandler)
     server.serve_forever()
 EOF_WEB
     chmod +x /usr/local/bin/hw-metrics-web.py
