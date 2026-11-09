@@ -110,7 +110,7 @@ chmod 644 "$CONFIG_FILE"
 echo "[INFO] Создаем collect-hw-metrics.sh..."
 cat << 'EOF_COLLECT' > /usr/local/bin/collect-hw-metrics.sh
 #!/bin/bash
-# COLLECTOR_VERSION=2
+# COLLECTOR_VERSION=3
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 TMP_FILE="/var/cache/pve-metrics.json.tmp"
 OUT_FILE="/var/cache/pve-metrics.json"
@@ -151,6 +151,54 @@ if command -v upsc >/dev/null 2>&1; then
     fi
 fi
 
+# Заполненность диска, % (пусто, если определить нельзя).
+# Обычные разделы: как df, занято / (занято + доступно).
+# Если на диске есть LVM: (данные в смонтированных ФС + реально занятое место
+# thin-пулов) / размер диска. ФС на thin-томах отдельно не считаются, они уже в пуле.
+disk_use() {
+    local dev="/dev/$1" size_b name type mp u a vg lv attr lsize pct esc denom
+    local used=0 cap=0 found=0 has_lvm=0
+    local -A seen=() thin=() pool=()
+    size_b=$(lsblk -dnbo SIZE "$dev" 2>/dev/null | head -n1)
+    [[ "$size_b" =~ ^[0-9]+$ ]] || return 0
+
+    if command -v lvs >/dev/null 2>&1; then
+        while IFS='|' read -r vg lv attr lsize pct; do
+            vg=${vg//[[:space:]]/}; lv=${lv//[[:space:]]/}; attr=${attr//[[:space:]]/}
+            esc="${vg//-/--}-${lv//-/--}"      # так имя LV выглядит в lsblk
+            case "${attr:0:1}" in
+                V) thin[$esc]=1 ;;
+                t) pool[$esc]="${lsize//[[:space:]]/}|${pct//[[:space:]]/}" ;;
+            esac
+        done < <(LC_ALL=C timeout 10 lvs --noheadings --nosuffix --units b --separator '|' \
+                    -o vg_name,lv_name,lv_attr,lv_size,data_percent 2>/dev/null)
+    fi
+
+    while read -r name type mp; do
+        [[ -n "$name" && -z "${seen[$name]:-}" ]] || continue
+        seen[$name]=1
+        [[ "$type" == lvm ]] && has_lvm=1
+        [[ "$mp" == /* && -z "${thin[$name]:-}" ]] || continue
+        mp=$(printf '%b' "$mp")
+        u=""; a=""
+        read -r u a < <(timeout 3 df -B1 --output=used,avail "$mp" 2>/dev/null | tail -n1)
+        [[ "$u" =~ ^[0-9]+$ && "$a" =~ ^[0-9]+$ ]] || continue
+        used=$((used + u)); cap=$((cap + u + a)); found=1
+    done < <(lsblk -nr -o NAME,TYPE,MOUNTPOINT "$dev" 2>/dev/null)
+
+    for esc in "${!pool[@]}"; do
+        [[ -n "${seen[${esc}_tdata]:-}" ]] || continue
+        lsize=${pool[$esc]%%|*}; pct=${pool[$esc]#*|}
+        [[ "$pct" =~ ^[0-9.]+$ ]] || continue
+        used=$((used + $(awk -v s="$lsize" -v p="$pct" 'BEGIN{printf "%.0f", s*p/100}')))
+        found=1; has_lvm=1
+    done
+
+    if (( has_lvm )); then denom=$size_b; else denom=$cap; fi
+    (( found && denom > 0 )) || return 0
+    awk -v u="$used" -v d="$denom" 'BEGIN{x=u*100/d; i=int(x); if (x>i) i++; if (i>100) i=100; print i}'
+}
+
 # Диски
 DISKS=()
 for dev_name in $(lsblk -d -n -o NAME,TYPE | awk '$2=="disk"{print $1}' | sort); do
@@ -158,6 +206,7 @@ for dev_name in $(lsblk -d -n -o NAME,TYPE | awk '$2=="disk"{print $1}' | sort);
     smart_out=$(smartctl -H -A "$dev" 2>/dev/null)
     info_out=$(smartctl -i "$dev" 2>/dev/null)
     [ -z "$info_out" ] && continue
+    use=$(disk_use "$dev_name")
 
     if [[ "$dev_name" == nvme* ]]; then
         model=$(echo "$info_out" | grep -E "Model Number:" | awk -F': ' '{print $2}' | xargs)
@@ -175,7 +224,7 @@ for dev_name in $(lsblk -d -n -o NAME,TYPE | awk '$2=="disk"{print $1}' | sort);
         else status="ОК"; fi
         DISKS+=("$(jq -nc --arg name "$dev_name" --arg model "$model" --arg size "$size" \
             --arg temp "$temp" --arg years "$years" --arg media_err "$media_err" \
-            --arg status "$status" '$ARGS.named')")
+            --arg status "$status" --arg use "$use" '$ARGS.named')")
     else
         model=$(echo "$info_out" | grep "Device Model:" | awk -F': ' '{print $2}' | xargs)
         [ -z "$model" ] && model=$(echo "$info_out" | grep -E "Vendor|Product" | awk -F': ' '{print $2}' | xargs | tr ' ' '_')
@@ -201,7 +250,7 @@ for dev_name in $(lsblk -d -n -o NAME,TYPE | awk '$2=="disk"{print $1}' | sort);
         else status="ОК"; fi
         DISKS+=("$(jq -nc --arg name "$dev_name" --arg model "$model" --arg size "$size" \
             --arg temp "$temp" --arg years "$years" --arg realloc "$realloc" --arg crc "$crc" \
-            --arg fresh_err "$fresh_err" --arg starts "$starts" --arg status "$status" '$ARGS.named')")
+            --arg fresh_err "$fresh_err" --arg starts "$starts" --arg status "$status" --arg use "$use" '$ARGS.named')")
     fi
 done
 
@@ -262,8 +311,8 @@ if jq -e '.disks[] | select(.name | startswith("nvme"))' "$CACHE_FILE" >/dev/nul
     fmt_nvme="%-7s | %-20s | %-7s | %-5s | %-5s | %-4s | %-3s | %s\n"
     printf "$fmt_nvme" "Диск   " "Модель              " "Объем  " "Use% " "Темп" "Лет " "Err" "Статус"
     echo   "-----------------------------------------------------------------------------------------------"
-    jq -r '.disks[] | select(.name | startswith("nvme")) | [.name, .model, .size, .temp, .years, .media_err, .status] | map(. // "") | join("\u001f")' "$CACHE_FILE" | while IFS=$'\x1f' read -r name model size temp years media_err status; do
-        use_pct=$(timeout 3 df -h | grep "/dev/$name" | awk '{print $5}' | head -n1); [[ -z "$use_pct" ]] && use_pct="-"
+    jq -r '.disks[] | select(.name | startswith("nvme")) | [.name, .model, .size, .use, .temp, .years, .media_err, .status] | map(. // "") | join("\u001f")' "$CACHE_FILE" | while IFS=$'\x1f' read -r name model size use temp years media_err status; do
+        use_pct="-"; [[ -n "$use" ]] && use_pct="${use}%"
         printf "$fmt_nvme" "$name" "${model:-Unknown}" "${size:-?}" "$use_pct" "${temp:-0}°C" "${years:-0}" "${media_err:-0}" "$status"
     done
     echo   "-----------------------------------------------------------------------------------------------"
@@ -273,8 +322,8 @@ if jq -e '.disks[] | select(.name | startswith("sd"))' "$CACHE_FILE" >/dev/null 
     fmt="%-4s | %-20s | %-7s | %-5s | %-5s | %-4s | %-3s | %-3s | %-3s | %-6s | %s\n"
     printf "$fmt" "Диск" "Модель              " "Объем  " "Use% " "Темп" "Лет " "Bad" "CRC" "Err" "Циклы " "Статус"
     echo   "-----------------------------------------------------------------------------------------------"
-    jq -r '.disks[] | select(.name | startswith("sd")) | [.name, .model, .size, .temp, .years, .realloc, .crc, .fresh_err, .starts, .status] | map(. // "") | join("\u001f")' "$CACHE_FILE" | while IFS=$'\x1f' read -r name model size temp years realloc crc fresh_err starts status; do
-        use_pct=$(timeout 3 df -h | grep "/dev/$name" | awk '{print $5}' | head -n1); [[ -z "$use_pct" ]] && use_pct="-"
+    jq -r '.disks[] | select(.name | startswith("sd")) | [.name, .model, .size, .use, .temp, .years, .realloc, .crc, .fresh_err, .starts, .status] | map(. // "") | join("\u001f")' "$CACHE_FILE" | while IFS=$'\x1f' read -r name model size use temp years realloc crc fresh_err starts status; do
+        use_pct="-"; [[ -n "$use" ]] && use_pct="${use}%"
         printf "$fmt" "$name" "${model:-Unknown}" "${size:-?}" "$use_pct" "${temp:-0}°C" "${years:-0}" "${realloc:-0}" "${crc:-0}" "${fresh_err:-0}" "${starts:--}" "$status"
     done
     echo   "-----------------------------------------------------------------------------------------------"
@@ -335,7 +384,7 @@ def run_remote(host, hw_script, collect_script, service_script, timer_script, co
         # Коллектор нужной версии и свежий кэш на месте?
         check_cache = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", f"root@{host}",
-             "test -f /var/cache/pve-metrics.json && grep -q 'COLLECTOR_VERSION=2' /usr/local/bin/collect-hw-metrics.sh"],
+             "test -f /var/cache/pve-metrics.json && grep -q 'COLLECTOR_VERSION=3' /usr/local/bin/collect-hw-metrics.sh"],
             capture_output=True, timeout=8
         )
 
