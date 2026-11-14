@@ -110,7 +110,7 @@ chmod 644 "$CONFIG_FILE"
 echo "[INFO] Создаем collect-hw-metrics.sh..."
 cat << 'EOF_COLLECT' > /usr/local/bin/collect-hw-metrics.sh
 #!/bin/bash
-# COLLECTOR_VERSION=3
+# COLLECTOR_VERSION=4
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 TMP_FILE="/var/cache/pve-metrics.json.tmp"
 OUT_FILE="/var/cache/pve-metrics.json"
@@ -119,10 +119,39 @@ NUT_HOST="127.0.0.1"
 UPS_NAME="auto"
 [ -f /etc/pve-metrics.conf ] && source /etc/pve-metrics.conf
 
-# CPU
-cpu_temp=""
+# CPU, вентиляторы, память, сетевая карта (всё из одного вызова sensors)
+cpu_temp=""; fan_rpm=""; fan_pwm=""; mem_temp=""; nic_temp=""
 if command -v sensors >/dev/null 2>&1; then
-    cpu_temp=$(sensors 2>/dev/null | grep -E "Package id 0:|Tctl:" | head -n1 | sed 's/.*: *+//' | awk '{print $1}' | sed 's/[^0-9.].*$//')
+    sensors_out=$(sensors 2>/dev/null)
+    cpu_temp=$(echo "$sensors_out" | grep -E "Package id 0:|Tctl:" | head -n1 | sed 's/.*: *+//' | awk '{print $1}' | sed 's/[^0-9.].*$//')
+    # Вентиляторы: ненулевые через "/", если все нулевые, то "0" (пустые разъёмы на 0 RPM не считаются).
+    # Память: максимум по датчикам модулей (spd5118 у DDR5, jc42 у DDR4), если они есть.
+    # Сетевая карта: температура чипа, если драйвер её отдаёт (r8169, igb, ixgbe и т.д.).
+    # pwm1: скважность вентилятора в % (первый найденный, если драйвер её отдаёт).
+    read -r fan_rpm fan_pwm mem_temp nic_temp < <(echo "$sensors_out" | awk '
+        /^$/ { chip = ""; next }
+        chip == "" { chip = $0; next }
+        /^Adapter:/ { next }
+        /^pwm1:/ { if (pwm == "") { p = $2; gsub(/[^0-9]/, "", p); pwm = p }; next }
+        /^[^ ]/ && match($0, /[0-9]+ RPM/) {
+            v = substr($0, RSTART, RLENGTH - 4) + 0
+            if (v > 0) fans = fans (fans == "" ? "" : "/") v; else zero = 1
+            next
+        }
+        $1 == "temp1:" {
+            t = $2; gsub(/[^0-9.]/, "", t)
+            if (t == "") next
+            if (chip ~ /^(spd5118|jc42)-/) { if (t + 0 > mem + 0) mem = t }
+            else if (chip ~ /^(r8169|igb|igc|ixgbe|i40e|ice|atlantic|tg3|bnxt)/) { if (t + 0 > nic + 0) nic = t }
+        }
+        END {
+            if (fans == "" && zero) fans = "0"
+            printf "%s %s %s %s\n", (fans == "" ? "-" : fans), (pwm == "" ? "-" : pwm), (mem == "" ? "-" : mem), (nic == "" ? "-" : nic)
+        }')
+    [ "$fan_rpm" = "-" ] && fan_rpm=""
+    [ "$fan_pwm" = "-" ] && fan_pwm=""
+    [ "$mem_temp" = "-" ] && mem_temp=""
+    [ "$nic_temp" = "-" ] && nic_temp=""
 fi
 
 # UPS
@@ -255,8 +284,9 @@ for dev_name in $(lsblk -d -n -o NAME,TYPE | awk '$2=="disk"{print $1}' | sort);
 done
 
 disks_json=$(printf '%s\n' "${DISKS[@]}" | jq -sc '.')
-if jq -nc --arg cpu "$cpu_temp" --arg ups "$ups_line" --argjson disks "$disks_json" \
-        '{cpu: $cpu, ups: $ups, disks: $disks}' > "$TMP_FILE"; then
+if jq -nc --arg cpu "$cpu_temp" --arg fan "$fan_rpm" --arg pwm "$fan_pwm" --arg mem "$mem_temp" --arg nic "$nic_temp" \
+        --arg ups "$ups_line" --argjson disks "$disks_json" \
+        '{cpu: $cpu, fan: $fan, pwm: $pwm, mem: $mem, nic: $nic, ups: $ups, disks: $disks}' > "$TMP_FILE"; then
     mv "$TMP_FILE" "$OUT_FILE"
     chmod 644 "$OUT_FILE"
 else
@@ -300,8 +330,17 @@ fi
 echo -e "=== СТАТУС СИСТЕМЫ $(hostname -f) на $(date '+%d.%m.%Y %H:%M') ==="
 echo ""
 
-cpu_temp=$(jq -r '.cpu | select(. != null) // empty' "$CACHE_FILE")
-if [[ -n "$cpu_temp" ]]; then echo "CPU: ${cpu_temp}°C"; fi
+cpu_temp=$(jq -r '.cpu // empty' "$CACHE_FILE")
+fan_rpm=$(jq -r '.fan // empty' "$CACHE_FILE")
+fan_pwm=$(jq -r '.pwm // empty' "$CACHE_FILE")
+mem_temp=$(jq -r '.mem // empty' "$CACHE_FILE")
+nic_temp=$(jq -r '.nic // empty' "$CACHE_FILE")
+parts=()
+[[ -n "$cpu_temp" ]] && parts+=("CPU: ${cpu_temp}°C")
+[[ -n "$fan_rpm" ]] && parts+=("Fan: ${fan_rpm} RPM${fan_pwm:+ (${fan_pwm}%)}")
+[[ -n "$mem_temp" ]] && parts+=("RAM: ${mem_temp}°C")
+[[ -n "$nic_temp" ]] && parts+=("NIC: ${nic_temp}°C")
+if (( ${#parts[@]} )); then line=$(printf ' | %s' "${parts[@]}"); echo "${line:3}"; fi
 
 ups_line=$(jq -r '.ups // empty' "$CACHE_FILE")
 if [[ -n "$ups_line" ]]; then echo "UPS: $ups_line"; fi
@@ -384,7 +423,7 @@ def run_remote(host, hw_script, collect_script, service_script, timer_script, co
         # Коллектор нужной версии и свежий кэш на месте?
         check_cache = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", f"root@{host}",
-             "test -f /var/cache/pve-metrics.json && grep -q 'COLLECTOR_VERSION=3' /usr/local/bin/collect-hw-metrics.sh"],
+             "test -f /var/cache/pve-metrics.json && grep -q 'COLLECTOR_VERSION=5' /usr/local/bin/collect-hw-metrics.sh"],
             capture_output=True, timeout=8
         )
 
@@ -797,13 +836,23 @@ cat << 'EOF_BLOCK' > "$BLOCK_JS"
                         return '<span style="color:' + color + '; font-weight:bold">' + txt + '</span>';
                     };
                     var html = '<div style="font-family: monospace; font-size: 12px;">';
-                    if (obj.cpu) {
-                        // пороги CPU: >=80 оранжевый, >=90 красный
-                        var c = parseFloat(obj.cpu);
-                        var cs = 'CPU: ' + obj.cpu + '&deg;C';
-                        if (c >= 90) cs = hl(cs, '#d32f2f'); else if (c >= 80) cs = hl(cs, '#e65100');
-                        html += cs + '<br>';
+                    // температуры: от warn оранжевый, от crit красный
+                    var lvl = function(txt, v, warn, crit) {
+                        var f = parseFloat(v);
+                        if (f >= crit) return hl(txt, '#d32f2f');
+                        if (f >= warn) return hl(txt, '#e65100');
+                        return txt;
+                    };
+                    var parts = [];
+                    if (obj.cpu) parts.push(lvl('CPU: ' + obj.cpu + '&deg;C', obj.cpu, 85, 95));
+                    if (obj.fan) {
+                        // вентилятор на 0 RPM красный только при горячем CPU (на холодном он может штатно стоять)
+                        var ft = 'Fan: ' + obj.fan + ' RPM' + (obj.pwm ? ' (' + obj.pwm + '%)' : '');
+                        parts.push((obj.fan === '0' && parseFloat(obj.cpu) >= 60) ? hl(ft, '#d32f2f') : ft);
                     }
+                    if (obj.mem) parts.push(lvl('RAM: ' + obj.mem + '&deg;C', obj.mem, 70, 85));
+                    if (obj.nic) parts.push(lvl('NIC: ' + obj.nic + '&deg;C', obj.nic, 85, 100));
+                    if (parts.length) html += parts.join(' | ') + '<br>';
                     if (obj.disks && obj.disks.length) {
                         // статус диска считает коллектор; 'OK' (лат.) и 'ОК' (кир.) = норма, всё остальное красным
                         var d = obj.disks.map(function(x) {
