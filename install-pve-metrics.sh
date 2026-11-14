@@ -110,7 +110,7 @@ chmod 644 "$CONFIG_FILE"
 echo "[INFO] Создаем collect-hw-metrics.sh..."
 cat << 'EOF_COLLECT' > /usr/local/bin/collect-hw-metrics.sh
 #!/bin/bash
-# COLLECTOR_VERSION=4
+# COLLECTOR_VERSION=5
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 TMP_FILE="/var/cache/pve-metrics.json.tmp"
 OUT_FILE="/var/cache/pve-metrics.json"
@@ -391,6 +391,7 @@ import subprocess
 import concurrent.futures
 import html
 import os
+import re
 
 CONFIG_FILE = "/etc/pve-metrics.conf"
 PORT = 9098
@@ -420,10 +421,13 @@ def run_local():
 
 def run_remote(host, hw_script, collect_script, service_script, timer_script, config_data):
     try:
-        # Коллектор нужной версии и свежий кэш на месте?
+        # Нужная версия коллектора берётся из заголовка локального коллектора (единственный источник правды).
+        m = re.search(r'^# COLLECTOR_VERSION=(\d+)\s*$', collect_script, re.M)
+        remote_check = "test -f /var/cache/pve-metrics.json"
+        if m:
+            remote_check += f" && grep -qx '# COLLECTOR_VERSION={m.group(1)}' /usr/local/bin/collect-hw-metrics.sh"
         check_cache = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", f"root@{host}",
-             "test -f /var/cache/pve-metrics.json && grep -q 'COLLECTOR_VERSION=5' /usr/local/bin/collect-hw-metrics.sh"],
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", f"root@{host}", remote_check],
             capture_output=True, timeout=8
         )
 
