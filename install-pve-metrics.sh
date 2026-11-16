@@ -110,7 +110,7 @@ chmod 644 "$CONFIG_FILE"
 echo "[INFO] Создаем collect-hw-metrics.sh..."
 cat << 'EOF_COLLECT' > /usr/local/bin/collect-hw-metrics.sh
 #!/bin/bash
-# COLLECTOR_VERSION=5
+# COLLECTOR_VERSION=6
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 TMP_FILE="/var/cache/pve-metrics.json.tmp"
 OUT_FILE="/var/cache/pve-metrics.json"
@@ -266,20 +266,28 @@ for dev_name in $(lsblk -d -n -o NAME,TYPE | awk '$2=="disk"{print $1}' | sort);
         crc=$(echo "$smart_out" | grep "UDMA_CRC_Error_Count" | awk '{print $10}' | head -n1 | tr -dc '0-9')
         starts=$(echo "$smart_out" | grep "Start_Stop_Count" | awk '{print $10}' | head -n1 | tr -dc '0-9')
         if [[ -n "$hours" && "$hours" -gt 0 ]]; then
-            cutoff=$(( hours - 120 )); [[ $cutoff -lt 0 ]] && cutoff=0
+            cutoff=$(( hours - 24 )); [[ $cutoff -lt 0 ]] && cutoff=0
             fresh_err=$(smartctl -l error "$dev" 2>/dev/null | grep "lifetime:" | sed -E 's/.*lifetime:[[:space:]]*([0-9]+).*/\1/' | awk -v cut="$cutoff" '$1 >= cut' | wc -l)
-        else fresh_err=0; fi
+            fresh_crc=$(smartctl -l error "$dev" 2>/dev/null | awk -v cut="$cutoff" '
+                /occurred at disk power-on lifetime:/ {
+                    if (match($0, /lifetime:[[:space:]]*[0-9]+/)) {
+                        s = substr($0, RSTART, RLENGTH); sub(/lifetime:[[:space:]]*/, "", s); lt = s + 0
+                    }
+                }
+                /ICRC/ && lt >= cut { c++ }
+                END { print c + 0 }')
+        else fresh_err=0; fresh_crc=0; fi
         if [[ -z "$hours" || "$hours" -gt 300000 ]]; then years="?"; else years=$(awk "BEGIN {printf \"%.1f\", $hours / 8760}"); fi
         health=$(echo "$smart_out" | grep "test result" | awk '{print $6}')
         if [[ "$health" != "PASSED" && -n "$health" ]]; then status="FAIL";
         elif [[ "${pending:-0}" -gt 0 ]]; then status="BAD!";
         elif [[ "${realloc:-0}" -gt 5 ]]; then status="WARN";
-        elif [[ "${crc:-0}" -gt 0 ]]; then status="CABLE";
+        elif [[ "${fresh_crc:-0}" -gt 0 ]]; then status="CABLE";
         elif [[ "${temp:-0}" -gt 45 ]]; then status="HOT!";
         else status="ОК"; fi
         DISKS+=("$(jq -nc --arg name "$dev_name" --arg model "$model" --arg size "$size" \
             --arg temp "$temp" --arg years "$years" --arg realloc "$realloc" --arg crc "$crc" \
-            --arg fresh_err "$fresh_err" --arg starts "$starts" --arg status "$status" --arg use "$use" '$ARGS.named')")
+            --arg fresh_crc "$fresh_crc" --arg fresh_err "$fresh_err" --arg starts "$starts" --arg status "$status" --arg use "$use" '$ARGS.named')")
     fi
 done
 
@@ -371,7 +379,7 @@ fi
 DF_OUT=$(timeout 3 df -h)
 if [[ -n "$DF_OUT" ]]; then
     echo "$DF_OUT" | grep Filesystem
-    echo "$DF_OUT" | grep pve | grep -v fuse | grep -v '^[1-9]' | sort -k6
+    echo "$DF_OUT" | grep pve | grep -v fuse | grep -v '^[1-9]' | sort
     echo "$DF_OUT" | grep pve | grep -v fuse | grep    '^[1-9]' | sort
 fi
 echo   "-----------------------------------------------------------------------------------------------"
