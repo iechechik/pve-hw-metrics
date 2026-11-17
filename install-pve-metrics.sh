@@ -379,7 +379,8 @@ fi
 DF_OUT=$(timeout 3 df -h)
 if [[ -n "$DF_OUT" ]]; then
     echo "$DF_OUT" | grep Filesystem
-    echo "$DF_OUT" | grep pve | grep -v fuse | grep -v '^[1-9]' | sort
+    echo "$DF_OUT" | grep pve | grep -v fuse | grep -v '^[1-9]' | grep pve-root
+    echo "$DF_OUT" | grep pve | grep -v fuse | grep -v '^[1-9]' | grep -v pve-root | sort
     echo "$DF_OUT" | grep pve | grep -v fuse | grep    '^[1-9]' | sort
 fi
 echo   "-----------------------------------------------------------------------------------------------"
