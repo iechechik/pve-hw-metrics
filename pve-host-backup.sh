@@ -70,6 +70,8 @@ MARKER=.pve-backup-mirror
 # диске каталог и лог создадутся на системном разделе.
 LOG_READY=0
 FAILS=0
+PROBLEMS=()          # все WARN/FAIL с номером шага, выводятся списком в конце
+CUR_STEP="[старт]"
 _emit() {  # _emit УРОВЕНЬ текст
     local m; m="[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2"
     echo "$m"
@@ -79,10 +81,10 @@ _emit() {  # _emit УРОВЕНЬ текст
 log_message() { _emit "INFO" "$*"; }
 log_detail()  { _emit "INFO" "    $*"; }
 log_ok()      { _emit " OK " "$*"; }
-log_warn()    { _emit "WARN" "$*";  FAILS=$((FAILS + 1)); logger -t pve-host-backup -- "WARN: $*" 2>/dev/null; }
-log_error()   { _emit "FAIL" "$*";  FAILS=$((FAILS + 1)); logger -t pve-host-backup -- "FAIL: $*" 2>/dev/null; }
+log_warn()    { _emit "WARN" "$*";  FAILS=$((FAILS + 1)); PROBLEMS+=("WARN|$CUR_STEP $*"); logger -t pve-host-backup -- "WARN: $*" 2>/dev/null; }
+log_error()   { _emit "FAIL" "$*";  FAILS=$((FAILS + 1)); PROBLEMS+=("FAIL|$CUR_STEP $*"); logger -t pve-host-backup -- "FAIL: $*" 2>/dev/null; }
 fatal()       { _emit "FAIL" "$*";  logger -t pve-host-backup -- "FATAL: $*" 2>/dev/null; exit 1; }
-step()        { _emit "INFO" "--- $* ---"; }
+step()        { CUR_STEP=${1%% *}; _emit "INFO" "--- $* ---"; }
 tail_detail() { local l; while IFS= read -r l; do [ -n "$l" ] && log_detail "$l"; done < <(tail -n "${2:-3}" "$1"); }
 
 hbytes() {  # 1234567 -> 1.2MB ; 0 -> 0 B
@@ -135,11 +137,14 @@ run_rsync() {
     [ "$DRY_RUN" = 1 ] && dry=(-n)
     out=$(mktemp -p "$WORK")
     LC_ALL=C rsync "${dry[@]}" --stats "$@" > "$out" 2>&1; rc=$?
-    if [ $rc -eq 0 ]; then
+    # 0 = ок; 24 = часть файлов исчезла между составлением списка и копированием
+    # (у работающих баз, например VictoriaMetrics, это обычное дело), остальное скопировано
+    if [ $rc -eq 0 ] || [ $rc -eq 24 ]; then
         files=$(sed -n 's/^Number of regular files transferred: *//p' "$out" | head -1 | tr -d ,)
         bytes=$(sed -n 's/^Total transferred file size: *\([0-9,]*\) bytes.*/\1/p' "$out" | head -1 | tr -d ,)
         del=$(sed -n 's/^Number of deleted files: *\([0-9,]*\).*/\1/p' "$out" | head -1 | tr -d ,)
         log_ok "${dry:+(проба) }$what: передано файлов ${files:-?} ($(hbytes "${bytes:-0}")), удалено ${del:-0}"
+        [ $rc -eq 24 ] && log_detail "часть файлов исчезла во время копирования (код 24 у rsync): для работающих баз это норма"
         return 0
     fi
     log_error "$what: rsync завершился с кодом $rc"
@@ -185,6 +190,15 @@ trap 'rm -rf "$WORK"' EXIT
 LOG_READY=1
 log_message "===== Бэкап $HOST: начало ====="
 [ "$DRY_RUN" = 1 ] && log_message "РЕЖИМ ПРОБЫ: на приёмниках ничего не меняется, маркеры не ставятся, старое не удаляется"
+
+# Копия самого скрипта рядом с архивами: хранится в том виде, в каком он реально отработал
+# (дальше уезжает вместе с архивами на misc и в зеркало)
+SELF=$(readlink -f "$0")
+SELF_COPY="$HOME_DIR/${HOST}-backup.sh"
+if [ "$DRY_RUN" != 1 ] && [ -f "$SELF" ] && ! [ "$SELF" -ef "$SELF_COPY" ] && ! cmp -s "$SELF" "$SELF_COPY"; then
+    if cp -f "$SELF" "$SELF_COPY"; then log_message "Скрипт обновлён: $SELF_COPY"
+    else log_warn "не удалось сохранить копию скрипта в $SELF_COPY"; fi
+fi
 
 # changed_files КАТАЛОГ...: файлы, не принадлежащие ни одному пакету (созданы тобой или сгенерированы),
 # и файлы пакетов (conffile), изменённые относительно пакета; плюс маски юнитов (ссылки на /dev/null).
@@ -351,7 +365,13 @@ fi
 if [ $FAILS -eq 0 ]; then
     log_ok "===== Бэкап $HOST: завершён без проблем за $(duration $SECONDS) ====="
 else
-    log_warn "===== Бэкап $HOST: завершён, проблем: $FAILS, время $(duration $SECONDS) ====="
+    n=$FAILS
+    log_message "Что пошло не так:"
+    i=0
+    for p in "${PROBLEMS[@]}"; do
+        i=$((i + 1)); _emit "${p%%|*}" "    $i) ${p#*|}"
+    done
+    log_warn "===== Бэкап $HOST: завершён, проблем: $n, время $(duration $SECONDS) ====="
 fi
 echo "--------------------------------" >> "$LOG"
 
